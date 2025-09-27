@@ -1,0 +1,4 @@
+experiments/logs/
+*.out
+rollouts/
+hf_download.py
