@@ -53,6 +53,7 @@ SYSTEM_PROMPT = (
     "A chat between a curious user and an artificial intelligence assistant. "
     "The assistant gives helpful, detailed, and polite answers to the user's questions."
 )
+# v01 系列模型遵循聊天式提示词格式，因此提前准备系统提示语
 
 
 def get_openvla_prompt(instruction: str, openvla_path: Union[str, Path]) -> str:
@@ -60,6 +61,7 @@ def get_openvla_prompt(instruction: str, openvla_path: Union[str, Path]) -> str:
         return f"{SYSTEM_PROMPT} USER: What action should the robot take to {instruction.lower()}? ASSISTANT:"
     else:
         return f"In: What action should the robot take to {instruction.lower()}?\nOut:"
+# 不同版本的模型使用不同的前缀模板，保证文本输入符合训练时的约定
 
 
 # === Server Interface ===
@@ -72,6 +74,7 @@ class OpenVLAServer:
         """
         self.openvla_path, self.attn_implementation = openvla_path, attn_implementation
         self.device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        # 优先使用 GPU 推理，若不可用则回退到 CPU
 
         # Load VLA Model using HF AutoClasses
         self.processor = AutoProcessor.from_pretrained(self.openvla_path, trust_remote_code=True)
@@ -87,6 +90,7 @@ class OpenVLAServer:
         if os.path.isdir(self.openvla_path):
             with open(Path(self.openvla_path) / "dataset_statistics.json", "r") as f:
                 self.vla.norm_stats = json.load(f)
+        # 若加载的是本地微调结果，则补充动作归一化统计，支持后续反归一化
 
     def predict_action(self, payload: Dict[str, Any]) -> str:
         try:
@@ -94,6 +98,7 @@ class OpenVLAServer:
                 # Support cases where `json_numpy` is hard to install, and numpy arrays are "double-encoded" as strings
                 assert len(payload.keys()) == 1, "Only uses encoded payload!"
                 payload = json.loads(payload["encoded"])
+                # 兼容前端无法直接传输 ndarray 的情况，先解析字符串后再推理
 
             # Parse payload components
             image, instruction = payload["image"], payload["instruction"]
@@ -107,6 +112,7 @@ class OpenVLAServer:
                 return JSONResponse(json_numpy.dumps(action))
             else:
                 return JSONResponse(action)
+            # 返回的动作默认已是 numpy 可解码格式，可选传入 unnorm_key 使用不同归一化参数
         except:  # noqa: E722
             logging.error(traceback.format_exc())
             logging.warning(
@@ -121,6 +127,7 @@ class OpenVLAServer:
         self.app = FastAPI()
         self.app.post("/act")(self.predict_action)
         uvicorn.run(self.app, host=host, port=port)
+        # 利用 FastAPI + Uvicorn 提供最低限度的 REST 服务，暴露 /act 接口
 
 
 @dataclass

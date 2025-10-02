@@ -51,6 +51,7 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# 禁用 tokenizer 的并行化警告，避免控制台输出干扰训练日志
 
 
 # # === Utilities ===
@@ -76,12 +77,15 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class FinetuneConfig:
     # fmt: off
     vla_path: str = "openvla/openvla-7b"                            # Path to OpenVLA model (on HuggingFace Hub)
+    # 默认从 HuggingFace 上的官方 OpenVLA 权重出发，可改为本地目录
 
     # Directory Paths
     data_root_dir: Path = Path("datasets/open-x-embodiment")        # Path to Open-X dataset directory
     dataset_name: str = "droid_wipe"                                # Name of fine-tuning dataset (e.g., `droid_wipe`)
+    # 对应 RLDS 数据集中子任务的名称，影响加载的数据混合
     run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
     adapter_tmp_dir: Path = Path("adapter-tmp")                     # Temporary directory for LoRA weights before fusing
+    # LoRA 训练时会先把适配器参数单独保存，再按需合并回全量模型
 
     # Fine-tuning Parameters
     batch_size: int = 16                                            # Fine-tuning batch size
@@ -94,6 +98,7 @@ class FinetuneConfig:
     save_latest_checkpoint_only: bool = True                        # Whether to save only one checkpoint per run and
                                                                     #   continually overwrite the latest checkpoint
                                                                     #   (If False, saves all checkpoints)
+    # 默认为只保留最近一次检查点，节省磁盘；设为 False 可保留完整快照
 
     # LoRA Arguments
     use_lora: bool = True                                           # Whether to use LoRA fine-tuning
@@ -113,10 +118,12 @@ class FinetuneConfig:
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
     print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
+    # 微调入口，主要流程包括加载基础模型、构建 RLDS 数据流、运行 LoRA 优化循环
 
     # [Validate] Ensure GPU Available & Set Device / Distributed Context
     assert torch.cuda.is_available(), "Fine-tuning assumes at least one GPU is available!"
     distributed_state = PartialState()
+    # Accelerate 提供的分布式上下文，统一处理多卡通信与主进程判定
     torch.cuda.set_device(device_id := distributed_state.local_process_index)
     torch.cuda.empty_cache()
 
@@ -138,6 +145,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Start =>> Build Directories
     run_dir, adapter_dir = cfg.run_root_dir / exp_id, cfg.adapter_tmp_dir / exp_id
     os.makedirs(run_dir, exist_ok=True)
+    # 微调运行目录与 LoRA 临时权重目录按实验 ID 区分，方便多组实验并存
 
     # Quantization Config =>> only if LoRA fine-tuning
     quantization_config = None
@@ -183,13 +191,16 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
     vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
+    # 包装成 DDP 以支持多 GPU，同步梯度并减少显存碎片
 
     # Create Optimizer =>> note that we default to a simple constant learning rate!
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+    # LoRA 只针对 trainable 参数求梯度，AdamW 负责更新
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
+    # ActionTokenizer 把连续控制信号映射到离散 token，保持与语言模型输出空间一致
 
     # Load Fine-tuning Dataset =>> note that we use an RLDS-formatted dataset following Open X-Embodiment by default.
     #   =>> If you want to use a non-RLDS dataset (e.g., a standard PyTorch Dataset) see the following commented block.
@@ -212,6 +223,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         image_transform=processor.image_processor.apply_transform,
         prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
     )
+    # RLDSBatchTransform 负责拼接图像、语言提示与动作标签，形成自回归监督信号
     vla_dataset = RLDSDataset(
         cfg.data_root_dir,
         cfg.dataset_name,
@@ -224,6 +236,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # [Important] Save Dataset Statistics =>> used to de-normalize actions for inference!
     if distributed_state.is_main_process:
         save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)
+        # 保存归一化统计，推理时可还原动作尺度
 
     # Create Collator and DataLoader
     collator = PaddedCollatorForActionPrediction(
@@ -236,15 +249,18 @@ def finetune(cfg: FinetuneConfig) -> None:
         collate_fn=collator,
         num_workers=0,  # Important =>> Set to 0 if using RLDS; TFDS rolls its own parallelism!
     )
+    # RLDS 数据集内部已经处理并行 IO，这里保持单线程避免与 TFDS 竞争
 
     # Initialize Logging =>> W&B
     if distributed_state.is_main_process:
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}")
+        # 仅主进程写 W&B，避免重复创建多份 run
 
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
     recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
     recent_action_accuracies = deque(maxlen=cfg.grad_accumulation_steps)
     recent_l1_losses = deque(maxlen=cfg.grad_accumulation_steps)
+    # 最近窗口内的指标用于平滑显示，避免因梯度累积而产生噪声
 
     # Train!
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
@@ -262,9 +278,11 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Normalize loss to account for gradient accumulation
             normalized_loss = loss / cfg.grad_accumulation_steps
+            # 按累积步数缩放 loss，保证等效的全局学习率
 
             # Backward pass
             normalized_loss.backward()
+            # 反向传播由 DDP 管理梯度同步
 
             # Compute Accuracy and L1 Loss for Logging
             action_logits = output.logits[:, vla.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
@@ -316,6 +334,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 optimizer.step()
                 optimizer.zero_grad()
                 progress.update()
+                # 达到梯度累积的步长后执行一次参数更新
 
             # Save Model Checkpoint =>> by default, only keeps the latest checkpoint, continually overwriting it!
             if gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0:
@@ -328,9 +347,11 @@ def finetune(cfg: FinetuneConfig) -> None:
                     # Save Processor & Weights
                     processor.save_pretrained(run_dir)
                     vla.module.save_pretrained(save_dir)
+                    # LoRA 模式下先把适配器权重单独输出，后续再合并
 
                 # Wait for processor and adapter weights to be saved by main process
                 dist.barrier()
+                # 等待主进程完成权重写出，确保其它进程不会提前继续
 
                 # Merge LoRA weights into model backbone for faster inference
                 #   =>> Note that merging is slow and can be done post-hoc to speed up training
@@ -357,6 +378,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                             # Save processor and model weights to new directory
                             processor.save_pretrained(checkpoint_dir)
                             merged_vla.save_pretrained(checkpoint_dir)
+                            # 当需要保留历史权重时，为每个步数创建独立目录
 
                             print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {checkpoint_dir}")
 

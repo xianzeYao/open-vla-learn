@@ -14,32 +14,33 @@ Run with:
     - [Single Node One-GPU (Debug)] : torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/train.py
     - [Single Node Multi-GPU (= $K)]: torchrun --standalone --nnodes 1 --nproc-per-node $K vla-scripts/train.py
 """
+# Vision-Language-Action 训练脚本说明：依托预训练 VLM，使用 PyTorch FSDP 多机多卡训练，并提供常用运行方式与先决条件。
 
-import json
-import os
-import re
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional, Tuple, Union
+import json  # JSON 配置读写工具
+import os  # 访问环境变量与路径的 OS 工具
+import re  # 正则解析检查点命名
+from dataclasses import dataclass, field  # 定义配置数据类
+from pathlib import Path  # 跨平台路径操作
+from typing import Optional, Tuple, Union  # 类型注解提升可读性
 
-import draccus
-import torch
-import torch.distributed as dist
-import yaml
+import draccus  # 把数据类映射到命令行的配置库
+import torch  # PyTorch 张量与自动求导
+import torch.distributed as dist  # 分布式通信工具
+import yaml  # YAML 解析与序列化
 
-from prismatic.conf import VLAConfig, VLARegistry
-from prismatic.models import load, load_vla
-from prismatic.overwatch import initialize_overwatch
-from prismatic.training import VLAMetrics, get_train_strategy
-from prismatic.util import set_global_seed
-from prismatic.vla import get_vla_dataset_and_collator
-from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+from prismatic.conf import VLAConfig, VLARegistry  # VLA 配置与注册表
+from prismatic.models import load, load_vla  # 加载基础模型或增量模型
+from prismatic.overwatch import initialize_overwatch  # 初始化统一日志
+from prismatic.training import VLAMetrics, get_train_strategy  # 指标与训练策略工厂
+from prismatic.util import set_global_seed  # 设置随机种子
+from prismatic.vla import get_vla_dataset_and_collator  # 构建 VLA 数据管线
+from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics  # 保存数据统计
 
-# Sane Defaults
+# 环境默认配置
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-# Initialize Overwatch =>> Wraps `logging.Logger`
+# 初始化 Overwatch，统一管理多进程日志与状态
 overwatch = initialize_overwatch(__name__)
 
 
@@ -47,38 +48,37 @@ overwatch = initialize_overwatch(__name__)
 class TrainConfig:
     # fmt: off
 
-    # VLAConfig (`prismatic/conf/vla.py`); override with --vla.type `VLARegistry.<VLA>.vla_id`
+    # VLAConfig 定义位于 prismatic/conf/vla.py，可通过 --vla.type 指定其它预设
     vla: VLAConfig = field(
         default_factory=VLAConfig.get_choice_class(VLARegistry.DINOSIGLIP_224PX_MX_OXE_MAGIC_SOUP_PLUS.vla_id)
     )
 
-    # Directory Paths
-    data_root_dir: Path = Path(                                     # Path to Open-X dataset directory
+    # 目录相关参数
+    data_root_dir: Path = Path(                                     # Open-X 数据集所在位置
         "datasets/open-x-embodiment"
     )
-    run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
+    run_root_dir: Path = Path("runs")                               # 训练日志与模型输出目录
 
-    # Resume Run Parameters
-    pretrained_checkpoint: Optional[Path] = None                    # Absolute Path to Checkpoint
-    is_resume: bool = True                                          # Whether we are continuing a prior training run
-                                                                    #   (only applicable given pretrained checkpoint)
-    resume_step: Optional[int] = None                               # Global Step to Resume (should match checkpoint)
-    resume_epoch: Optional[int] = None                              # Epoch to Resume (should match checkpoint)
+    # 断点续训参数
+    pretrained_checkpoint: Optional[Path] = None                    # 预训练或断点权重路径
+    is_resume: bool = True                                          # 指示是否继续之前的训练
+    resume_step: Optional[int] = None                               # 恢复时的全局步数
+    resume_epoch: Optional[int] = None                              # 恢复时的轮次编号
 
-    # Run Arguments
-    run_id: Optional[str] = None                                    # Run ID for logging, Weights & Biases
-    run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
-    save_interval: int = 2500                                       # Interval for saving checkpoints (in steps)
-    image_aug: bool = False                                         # Whether to enable image augmentations
-    seed: int = 7                                                   # Random seed (for reproducibility)
+    # 运行参数
+    run_id: Optional[str] = None                                    # 日志使用的运行 ID
+    run_id_note: Optional[str] = None                               # 额外的运行标记
+    save_interval: int = 2500                                       # 检查点保存间隔（按步数）
+    image_aug: bool = False                                         # 是否启用图像增强
+    seed: int = 7                                                   # 随机种子
 
-    # HF Hub Credentials (for any gated models)
-    hf_token: Union[str, Path] = Path(".hf_token")                  # Environment variable or Path to HF Token
+    # Hugging Face 凭证
+    hf_token: Union[str, Path] = Path(".hf_token")                  # HF 访问令牌（路径或环境变量名）
 
-    # Tracking Parameters
-    trackers: Tuple[str, ...] = ("jsonl", "wandb")                  # Trackers to initialize (if W&B, add config!)
-    wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
-    wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
+    # 日志追踪参数
+    trackers: Tuple[str, ...] = ("jsonl", "wandb")                  # 启动的追踪器类型
+    wandb_project: str = "openvla"                                  # W&B 项目名
+    wandb_entity: str = "stanford-voltron"                          # W&B workspace 名称
 
     def __post_init__(self) -> None:
         """Lift optimization parameters from `self.vla` for ease of use =>> validate on `expected_world_size`"""
@@ -86,6 +86,7 @@ class TrainConfig:
         self.max_steps = self.vla.max_steps
         self.global_batch_size = self.vla.global_batch_size
         self.per_device_batch_size = self.vla.per_device_batch_size
+        # 将优化相关超参提升到顶层字段，方便命令行覆盖
 
         self.learning_rate = self.vla.learning_rate
         self.weight_decay = self.vla.weight_decay
@@ -95,7 +96,7 @@ class TrainConfig:
 
         self.train_strategy = self.vla.train_strategy
 
-        # [Validate] Assert on `expected_world_size`
+        # 校验当前进程组规模是否符合配置中的 expected_world_size
         assert (
             self.vla.expected_world_size == overwatch.world_size()
         ), f"Expected World Size = {self.vla.expected_world_size} but Found {overwatch.world_size()} GPUs!"
@@ -103,15 +104,18 @@ class TrainConfig:
     # fmt: on
 
 
+# draccus.wrap() 将数据类配置映射成命令行参数
 @draccus.wrap()
 def train(cfg: TrainConfig) -> None:
     overwatch.info("OpenVLA Training :: Warming Up")
+    # 训练入口：初始化设备、模型、数据集与训练策略
 
-    # Note => Under `torchrun` initializing `overwatch` will automatically set up `torch.distributed`
+    # 在 torchrun 环境下初始化 overwatch 会同步初始化 torch.distributed
     torch.cuda.set_device(device_id := overwatch.local_rank())
+    # local_rank 指示当前进程绑定的 GPU 序号
     torch.cuda.empty_cache()
 
-    # Configure Unique Run Name & Save Directory
+    # 组装唯一的运行 ID 并创建输出目录
     vla_id = cfg.vla.vla_id
     cfg.run_id = (
         f"{vla_id}+n{cfg.vla.expected_world_size // 8}+b{cfg.per_device_batch_size}+x{cfg.seed}"
@@ -123,50 +127,55 @@ def train(cfg: TrainConfig) -> None:
     if cfg.image_aug:
         cfg.run_id += "--image_aug"
 
-    # Start =>> Build Directories and Set Randomness
+    # 创建运行目录并设置随机种子
     overwatch.info('"Do or do not; there is no try."', ctx_level=1)
-    hf_token = cfg.hf_token.read_text().strip() if isinstance(cfg.hf_token, Path) else os.environ[cfg.hf_token]
+    hf_token = cfg.hf_token.read_text().strip() if isinstance(
+        cfg.hf_token, Path) else os.environ[cfg.hf_token]
+    # 支持从文件或环境变量读取 Hugging Face 凭证
     worker_init_fn = set_global_seed(cfg.seed, get_worker_init_fn=True)
     os.makedirs(run_dir := (cfg.run_root_dir / cfg.run_id), exist_ok=True)
     os.makedirs(cfg.run_root_dir / cfg.run_id / "checkpoints", exist_ok=True)
 
-    # Save Configuration =>> additionally save a JSON version for later HF Integration
+    # 保存配置文件（同时生成 YAML 与 JSON 两份）
     if overwatch.is_rank_zero():
+        # 仅由 rank0 负责写盘，避免多进程同时写文件
         draccus.dump(cfg, open(run_dir / "config.yaml", "w"))
         with open(run_dir / "config.yaml", "r") as f_yaml, open(run_dir / "config.json", "w") as f_json:
             yaml_cfg = yaml.safe_load(f_yaml)
             json.dump(yaml_cfg, f_json, indent=2)
 
-    # Load VLA checkpoint (if resuming from training) or Base VLM otherwise (from `cfg.vla.base_vlm` ID or Path)
-    #   =>> Note :: Verifies that all parameters are loaded in FP32 on load!
+    # 加载基础 VLM 或已有的 VLA 检查点，并确保参数以 FP32 载入
     overwatch.info(f"Loading Base VLM `{cfg.vla.base_vlm}` from ID/Path")
     if cfg.pretrained_checkpoint is not None:
-        # [Validate] Pretrained Checkpoint `step` and `epoch` should match `resume_step` and `resume_epoch`
-        #   =>> Note :: We make developers pass in `resume_*` arguments as an extra sanity check!
+        # 断点恢复时解析文件名，校验 step 与 epoch 是否匹配
         if cfg.is_resume:
-            assert int(re.search("step-(.+?)-", cfg.pretrained_checkpoint.name).group(1)) == cfg.resume_step
-            assert int(re.search("epoch-(.+?)-", cfg.pretrained_checkpoint.name).group(1)) == cfg.resume_epoch
+            assert int(re.search(
+                "step-(.+?)-", cfg.pretrained_checkpoint.name).group(1)) == cfg.resume_step
+            assert int(re.search(
+                "epoch-(.+?)-", cfg.pretrained_checkpoint.name).group(1)) == cfg.resume_epoch
 
-        vlm = load_vla(cfg.pretrained_checkpoint, hf_token=hf_token, load_for_training=True)
+        vlm = load_vla(cfg.pretrained_checkpoint,
+                       hf_token=hf_token, load_for_training=True)
 
     else:
         vlm = load(cfg.vla.base_vlm, hf_token=hf_token, load_for_training=True)
 
-    # [Validate] Model should be in Full Precision!
+    # 校验模型参数均为 FP32，避免混合精度带来的不一致
     for param in vlm.parameters():
         assert param.dtype == torch.float32, f"Loaded VLM parameter not in full precision: {param}"
 
-    # Determine training "stage" based on frozen vs unfrozen parameters --> supports different fine-tuning schemes!
-    if not cfg.vla.freeze_vision_backbone and not cfg.vla.freeze_llm_backbone:
-        stage = "vla-full-train"  # Full fine-tuning
-    elif cfg.vla.freeze_vision_backbone and not cfg.vla.freeze_llm_backbone:
-        stage = "vla-train"  # Frozen vision encoder
-    elif not cfg.vla.freeze_vision_backbone and cfg.vla.freeze_llm_backbone:
+    # 根据各分支是否冻结来确定训练阶段，支持多种微调策略
+    if not cfg.vla.freeze_vision_backbone and not cfg.vla.freeze_llm_backbone:  # 无分支冻结，执行全量微调
+        stage = "vla-full-train"
+    elif cfg.vla.freeze_vision_backbone and not cfg.vla.freeze_llm_backbone:  # 冻结视觉分支，仅更新语言相关层
+        stage = "vla-train"
+    elif not cfg.vla.freeze_vision_backbone and cfg.vla.freeze_llm_backbone:  # 冻结大模型主体，仅保留末层可训练
         assert cfg.vla.unfreeze_last_llm_layer, "You should unfreeze at least the last layer of your LLM!"
-        stage = "vla-sandwich-train"  # Fine-tuning vision encoder, projector, and LLM last layer
+        # 该模式微调视觉编码器、投影层以及语言模型最后一层
+        stage = "vla-sandwich-train"
     elif cfg.vla.freeze_vision_backbone and cfg.vla.freeze_llm_backbone:
         assert cfg.vla.unfreeze_last_llm_layer, "Need to unfreeze at least last LLM layer to train!"
-        stage = "vla-last-layer-train"  # Fine-tuning LLM last layer only
+        stage = "vla-last-layer-train"  # 只训练语言模型的最后一层
     else:
         raise ValueError(
             "Weight freezing configuration not supported. VLA config has the following parameters: "
@@ -174,37 +183,45 @@ def train(cfg: TrainConfig) -> None:
             f"freeze_llm_backbone: {cfg.vla.freeze_llm_backbone}"
             f"unfreeze_last_llm_layer: {cfg.vla.unfreeze_last_llm_layer}"
         )
+    # 通过 stage 控制哪些子模块可训练，实现从全量到“夹心”式等不同解冻策略
 
-    # [Explicit] Call to `freeze_backbones` here for clarity =>> will log exactly what is/is not frozen
-    overwatch.info(f"Invoking `VLM.freeze_backbones()` for `{vla_id}` => Stage: `{stage}`")
+    # 显式调用 freeze_backbones，便于在日志中确认各分支冻结情况
+    overwatch.info(
+        f"Invoking `VLM.freeze_backbones()` for `{vla_id}` => Stage: `{stage}`")
     vlm.freeze_backbones(stage)
 
-    # Print number of total/trainable model parameters
+    # 统计模型总参数量与可训练参数量，记录到日志
     num_params = sum(p.numel() for p in vlm.parameters())
-    num_trainable_params = sum(p.numel() for p in vlm.parameters() if p.requires_grad)
+    num_trainable_params = sum(p.numel()
+                               for p in vlm.parameters() if p.requires_grad)
     overwatch.info(
         f"# Parameters (in millions): {num_params / 10**6:.3f} Total, {num_trainable_params / 10**6:.3f} Trainable"
     )
 
-    # Get VLA Dataset & Collator
-    overwatch.info(f"Creating VLA Open-X Dataset with Mixture `{cfg.vla.data_mix}`")
+    # 构建 VLA 数据集与 collator
+    overwatch.info(
+        f"Creating VLA Open-X Dataset with Mixture `{cfg.vla.data_mix}`")
+    # 按配置的混合比例组装 RLDS 数据集，统一处理图像、文本与动作
     vla_dataset, action_tokenizer, collator = get_vla_dataset_and_collator(
         cfg.data_root_dir,
         cfg.vla.data_mix,
-        image_transform=vlm.vision_backbone.get_image_transform(),
-        tokenizer=vlm.llm_backbone.get_tokenizer(),
-        prompt_builder_fn=vlm.llm_backbone.prompt_builder_fn,
-        default_image_resolution=vlm.vision_backbone.default_image_resolution,
-        shuffle_buffer_size=cfg.vla.shuffle_buffer_size,
+        image_transform=vlm.vision_backbone.get_image_transform(),  # 复用视觉骨干的图像标准化
+        tokenizer=vlm.llm_backbone.get_tokenizer(),  # 使用语言模型自带的 tokenizer
+        prompt_builder_fn=vlm.llm_backbone.prompt_builder_fn,  # 构建与模型格式匹配的提示词
+        default_image_resolution=vlm.vision_backbone.default_image_resolution,  # 控制输入图像分辨率
+        shuffle_buffer_size=cfg.vla.shuffle_buffer_size,  # RLDS 数据混合使用的乱序缓冲区
         image_aug=cfg.image_aug,
     )
+    # action_tokenizer 将连续动作离散化，collator 负责 PAD 与掩码以适配自回归训练
 
-    # Save dataset statistics for de-normalization at inference time
+    # 保存数据集统计信息，供推理阶段反归一化动作使用
     if overwatch.is_rank_zero():
+        # 仅由主进程写入统计文件，避免重复操作
         save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)
 
-    # Create Train Strategy
+    # 创建训练策略
     overwatch.info(f"Initializing Train Strategy `{cfg.train_strategy}`")
+    # TrainStrategy 内部封装 FSDP、优化器和学习率调度等组件
     train_strategy = get_train_strategy(
         train_strategy=cfg.train_strategy,
         vlm=vlm,
@@ -224,10 +241,13 @@ def train(cfg: TrainConfig) -> None:
         reduce_in_full_precision=cfg.vla.reduce_in_full_precision,
         worker_init_fn=worker_init_fn,
     )
-    train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(vla_dataset))
+    train_strategy.run_setup(
+        run_dir=run_dir, n_train_examples=len(vla_dataset))
+    # run_setup 会完成参数分片、检查点钩子与随机数初始化等准备工作
 
-    # Create Metrics =>> Handles on the fly tracking, logging to specified trackers (e.g., JSONL, Weights & Biases)
-    overwatch.info(f"Creating Metrics with Active Trackers => `{cfg.trackers}`")
+    # 创建指标记录器，用于实时追踪并写入指定的日志后端
+    overwatch.info(
+        f"Creating Metrics with Active Trackers => `{cfg.trackers}`")
     metrics = VLAMetrics(
         cfg.trackers,
         cfg.run_id,
@@ -238,8 +258,9 @@ def train(cfg: TrainConfig) -> None:
         resume_step=cfg.resume_step,
         resume_epoch=cfg.resume_epoch,
     )
+    # Metrics 负责写入 JSONL、W&B 等后端，并持久化运行配置
 
-    # Run VLA Training
+    # 启动训练循环
     overwatch.info("Starting VLA Training Loop")
     train_strategy.run_vla_training(
         vla_dataset,
@@ -248,12 +269,14 @@ def train(cfg: TrainConfig) -> None:
         metrics,
         save_interval=cfg.save_interval,
     )
+    # 训练循环由策略对象托管，负责驱动数据加载、前向后向以及定期保存检查点
 
-    # Finalize
+    # 训练结束，收尾日志
     overwatch.info("Done with Training =>> Finalizing Metrics")
     metrics.finalize()
+    # finalize 会关闭追踪器并刷新日志，确保数据完整写出
 
-    # And... we're done!
+    # 训练流程结束
     overwatch.info("... and that's all, folks!")
     dist.barrier()
     dist.destroy_process_group()

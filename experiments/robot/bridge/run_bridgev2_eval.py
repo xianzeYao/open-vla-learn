@@ -45,6 +45,7 @@ class GenerateConfig:
     pretrained_checkpoint: Union[str, Path] = ""                # Pretrained checkpoint path
     load_in_8bit: bool = False                                  # (For OpenVLA only) Load with 8-bit quantization
     load_in_4bit: bool = False                                  # (For OpenVLA only) Load with 4-bit quantization
+    # 评估阶段同样支持低比特量化加载，便于在资源受限的机器上运行
 
     center_crop: bool = False                                   # Center crop? (if trained w/ random crop image aug)
 
@@ -74,6 +75,7 @@ class GenerateConfig:
     # Utils
     #################################################################################################################
     save_data: bool = False                                     # Whether to save rollout data (images, actions, etc.)
+    # 打开后会记录图像、动作和状态，便于线下复盘
 
     # fmt: on
 
@@ -85,20 +87,25 @@ def eval_model_in_bridge_env(cfg: GenerateConfig) -> None:
 
     # [OpenVLA] Set action un-normalization key
     cfg.unnorm_key = "bridge_orig"
+    # 指定与 Bridge 数据集对应的反归一化键，确保动作尺度正确
 
     # Load model
     model = get_model(cfg)
+    # 根据配置创建策略模型，可是 OpenVLA 或其它模型族
 
     # [OpenVLA] Get Hugging Face processor
     processor = None
     if cfg.model_family == "openvla":
         processor = get_processor(cfg)
+        # OpenVLA 需要配套的 Processor 处理图像与文本输入
 
     # Initialize the WidowX environment
     env = get_widowx_env(cfg, model)
+    # 初始化 WidowX 机械臂仿真/实机接口，包括通信端口与初始位姿
 
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
+    # 根据模型需求确定摄像头图像缩放尺寸
 
     # Start evaluation
     task_label = ""
@@ -106,9 +113,11 @@ def eval_model_in_bridge_env(cfg: GenerateConfig) -> None:
     while episode_idx < cfg.max_episodes:
         # Get task description from user
         task_label = get_next_task_label(task_label)
+        # 通过终端交互输入下一轮的任务指令
 
         # Reset environment
         obs, _ = env.reset()
+        # 复位环境并获取初始观测，包括原始图像与机器人状态
 
         # Setup
         t = 0
@@ -118,6 +127,7 @@ def eval_model_in_bridge_env(cfg: GenerateConfig) -> None:
             rollout_images = []
             rollout_states = []
             rollout_actions = []
+            # 如需保存数据则准备缓存列表
 
         # Start episode
         input(f"Press Enter to start episode {episode_idx+1}...")
@@ -133,12 +143,15 @@ def eval_model_in_bridge_env(cfg: GenerateConfig) -> None:
 
                     # Refresh the camera image and proprioceptive state
                     obs = refresh_obs(obs, env)
+                    # 从机器人传感器刷新最新图像与状态
 
                     # Save full (not preprocessed) image for replay video
                     replay_images.append(obs["full_image"])
+                    # 保存未经过裁剪缩放的原图供回放视频使用
 
                     # Get preprocessed image
                     obs["full_image"] = get_preprocessed_image(obs, resize_size)
+                    # 对输入图像做模型要求的预处理（裁剪/缩放/归一化）
 
                     # Query model to get action
                     action = get_action(
@@ -148,17 +161,20 @@ def eval_model_in_bridge_env(cfg: GenerateConfig) -> None:
                         task_label,
                         processor=processor,
                     )
+                    # 将观测与指令送入策略模型，获得下一步动作
 
                     # [If saving rollout data] Save preprocessed image, robot state, and action
                     if cfg.save_data:
                         rollout_images.append(obs["full_image"])
                         rollout_states.append(obs["proprio"])
                         rollout_actions.append(action)
+                        # 记录模型输入与输出，方便之后分析
 
                     # Execute action
                     print("action:", action)
                     obs, _, _, _, _ = env.step(action)
                     t += 1
+                    # 将动作发送给 WidowX 并推进时间步
 
             except (KeyboardInterrupt, Exception) as e:
                 if isinstance(e, KeyboardInterrupt):
@@ -169,10 +185,12 @@ def eval_model_in_bridge_env(cfg: GenerateConfig) -> None:
 
         # Save a replay video of the episode
         save_rollout_video(replay_images, episode_idx)
+        # 每轮结束后导出回放视频，便于观察执行质量
 
         # [If saving rollout data] Save rollout data
         if cfg.save_data:
             save_rollout_data(replay_images, rollout_images, rollout_states, rollout_actions, idx=episode_idx)
+            # 当需要保存数据时，将图像、状态、动作统一写入磁盘
 
         # Redo episode or continue
         if input("Enter 'r' if you want to redo the episode, or press Enter to continue: ") != "r":

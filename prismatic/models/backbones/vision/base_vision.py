@@ -1,30 +1,28 @@
 """
 base_vision.py
 
-Abstract class definition of a Vision Backbone (Visual Featurizer), with full annotations of class methods, utility
-functions, and initialization logic.
-
-We also define the generic TimmViTBackbone class here, providing a default interface for loading any TIMM Vision
-Transformer model for feature extraction.
+本模块定义视觉骨干网络的抽象基类，集中描述特征提取器的公共接口、工具函数与初始化流程，同时提供
+TimmViTBackbone 作为 TIMM Vision Transformer 的通用封装。
 """
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from functools import partial
-from typing import Any, Callable, Dict, Optional, Protocol, Tuple, Union
+from abc import ABC, abstractmethod  # 定义抽象基类与抽象方法
+from dataclasses import dataclass  # 轻量级数据容器
+from functools import partial  # 生成携带默认参数的函数
+from typing import Any, Callable, Dict, Optional, Protocol, Tuple, Union  # 常用类型注解
 
-import timm
-import torch
-import torch.nn as nn
-import torchvision.transforms.functional as TVF
-from PIL.Image import Image
-from timm.models.vision_transformer import Block, VisionTransformer
-from torch.distributed.fsdp.wrap import _module_wrap_policy, _or_policy, transformer_auto_wrap_policy
-from torchvision.transforms import Compose, Resize
+import timm  # PyTorch 图像模型库，提供丰富的视觉骨干
+import torch  # 张量与自动求导框架
+import torch.nn as nn  # 神经网络组件
+import torchvision.transforms.functional as TVF  # 图像变换函数
+from PIL.Image import Image  # PIL 图像对象
+from timm.models.vision_transformer import Block, VisionTransformer  # TIMM 中的 ViT 模块定义
+from torch.distributed.fsdp.wrap import _module_wrap_policy, _or_policy, transformer_auto_wrap_policy  # FSDP 包裹策略工具
+from torchvision.transforms import Compose, Resize  # Torchvision 图像变换组合与缩放
 
 
-# === Utility Functions for Monkey-Patching ===
+# === 用于猴子补丁的工具函数 ===
 def unpack_tuple(fn: Callable[[Any], Tuple[Any]]) -> Callable[[Any], Any]:
+    # TIMM 某些接口返回元组，此处包装成只取首个元素，方便后续调用
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         result = fn(*args, **kwargs)
         return result[0] if isinstance(result, tuple) else result
@@ -32,25 +30,26 @@ def unpack_tuple(fn: Callable[[Any], Tuple[Any]]) -> Callable[[Any], Any]:
     return wrapper
 
 
-# === Interface for an Image Transform ===
+# === 图像变换接口定义，约束实现需可调用且返回张量或张量字典 ===
 class ImageTransform(Protocol):
     def __call__(self, img: Image, **kwargs: str) -> Union[torch.Tensor, Dict[str, torch.Tensor]]: ...
 
 
-# === Custom Torchvision Image Transforms ===
+# === 自定义 Torchvision 图像变换 ===
 @dataclass
 class LetterboxPad:
     padding_fill_value: Tuple[int, int, int]
 
     def __call__(self, image: Image) -> Image:
         """Given a PIL.Image, pad to square by adding a symmetric border around the height/width."""
+        # Letterbox 策略：利用对称填充补齐短边，保持长宽比不变
         (w, h), max_wh = image.size, max(image.size)
         horizontal_pad, vertical_pad = int((max_wh - w) / 2), int((max_wh - h) / 2)
         padding = (horizontal_pad, vertical_pad, horizontal_pad, vertical_pad)
         return TVF.pad(image, padding, fill=self.padding_fill_value, padding_mode="constant")
 
 
-# === Abstract Base Class for arbitrary Vision Backbones ===
+# === 视觉骨干网络的抽象基类，统一管理特征提取器、图像预处理和模型元信息 ===
 class VisionBackbone(nn.Module, ABC):
     def __init__(self, vision_backbone_id: str, image_resize_strategy: str, default_image_size: int = 224) -> None:
         super().__init__()
@@ -58,11 +57,12 @@ class VisionBackbone(nn.Module, ABC):
         self.image_resize_strategy: str = image_resize_strategy
         self.default_image_size: int = default_image_size
 
-        # Instance attributes for a Vision Backbone
-        self.featurizer: nn.Module = None
-        self.image_transform: ImageTransform = None
+        # 视觉骨干默认持有的组件：特征提取器与图像预处理器
+        self.featurizer: nn.Module = None  # 视觉编码主干，负责将图像映射到 patch/grid 表征
+        self.image_transform: ImageTransform = None  # 与主干匹配的图像预处理流程（裁剪、归一化等）
 
     def get_image_transform(self) -> ImageTransform:
+        # 返回当前骨干默认使用的图像预处理函数
         return self.image_transform
 
     @abstractmethod
@@ -90,7 +90,7 @@ class VisionBackbone(nn.Module, ABC):
     def half_precision_dtype(self) -> torch.dtype: ...
 
 
-# === Abstract Base Class for Arbitrary TIMM Vision Transformer Backbones ===
+# === TIMM Vision Transformer 骨干的抽象基类，统一封装加载与预处理逻辑 ===
 class TimmViTBackbone(VisionBackbone, ABC):
     def __init__(
         self,
@@ -105,7 +105,7 @@ class TimmViTBackbone(VisionBackbone, ABC):
         self.override_act_layer = override_act_layer
         self.dtype = torch.bfloat16
 
-        # Initialize Featurizer (ViT) by downloading from HF / TIMM Hub if necessary
+        # 初始化 ViT 特征提取器，必要时会自动从 TIMM 或 HF Hub 下载权重
         if self.override_act_layer is None:
             self.featurizer: VisionTransformer = timm.create_model(
                 self.timm_path_or_url, pretrained=True, num_classes=0, img_size=self.default_image_size
@@ -120,27 +120,26 @@ class TimmViTBackbone(VisionBackbone, ABC):
             )
         self.featurizer.eval()
 
-        # Monkey-Patch the `forward()` function of the featurizer to ensure FSDP-compatibility
-        #   => Note: By default set `get_intermediate_layers` to return the *SECOND-TO-LAST* layer patches!
-        #   => TODO (siddk) Remove after resolution of https://github.com/pytorch/pytorch/issues/109385
+        # 为确保与 FSDP 兼容，对 forward 进行猴子补丁，默认返回倒数第二层的 patch 表征
+        # 待 PyTorch 相关问题修复后可移除此逻辑（参考 issue 109385）
         self.featurizer.forward = unpack_tuple(
             partial(self.featurizer.get_intermediate_layers, n={len(self.featurizer.blocks) - 2})
         )
 
-        # Validation =>> for now, this class *only* supports TIMM Vision Transformers (but can be extended!)
+        # 目前仅支持 TIMM VisionTransformer，如需扩展其它视觉表征需补充实现
         assert isinstance(self.featurizer, VisionTransformer), (
             "Featurizer is not a TIMM VisionTransformer; if you would like to support a new visual representation, "
             "file an issue or implement the requisite logic (see `prismatic/models/backbones/vision/base_vision.py`)!"
         )
 
-        # Get Config =>> Note :: Override default image size to ensure correct image transform
+        # 读取 TIMM 的数据配置，并根据 default_image_size 覆写默认输入尺寸
         self.data_cfg = timm.data.resolve_model_data_config(self.featurizer)
         self.data_cfg["input_size"] = (3, self.default_image_size, self.default_image_size)
 
-        # Initialize Default Image Transform --> Modified by `self.image_resize_strategy`
+        # 根据数据配置创建默认图像变换，后续会结合 resize 策略做调整
         default_image_transform = timm.data.create_transform(**self.data_cfg, is_training=False)
 
-        # Fix =>> SigLIP & IN1K default transforms resize to *larger* than `self.default_image_size` (crops image)!
+        # 部分模型（SigLIP/IN1K）默认缩放尺寸大于目标尺寸，这里重写为严格 resize
         if "siglip" in self.timm_path_or_url or "in1k" in self.timm_path_or_url:
             assert isinstance(default_image_transform, Compose), "Unexpected `default_image_transform`!"
             assert isinstance(default_image_transform.transforms[0], Resize)
@@ -151,7 +150,7 @@ class TimmViTBackbone(VisionBackbone, ABC):
                 ]
             )
 
-        # Switch on `image_resize_strategy`
+        # 按照配置的 resize 策略构建最终图像变换流水线
         if self.image_resize_strategy == "resize-naive":
             assert isinstance(default_image_transform, Compose), "Unexpected `default_image_transform`!"
             assert isinstance(default_image_transform.transforms[0], Resize)
@@ -171,23 +170,23 @@ class TimmViTBackbone(VisionBackbone, ABC):
             assert isinstance(default_image_transform, Compose), "Unexpected `default_image_transform`!"
             assert "mean" in self.data_cfg, "TIMM `data_cfg` missing image normalization mean!"
 
-            # Compute Padding Fill Value (rescaled normalization mean if applicable)
+            # 计算填充颜色，基于归一化均值缩放至 0-255
             fill = tuple([int(x * 255) for x in self.data_cfg["mean"]])
 
-            # Build New Transform
+            # 构建带有 letterbox 的新变换流水线
             self.image_transform = Compose([LetterboxPad(fill), *default_image_transform.transforms])
 
         else:
             raise ValueError(f"Image Resize Strategy `{self.image_resize_strategy}` is not supported!")
 
     def get_fsdp_wrapping_policy(self) -> Callable:
-        """Return a simple FSDP policy that wraps each ViT block and then the _entire_ featurizer."""
+        """返回一个用于 FSDP 的包裹策略：逐个包装 ViT 模块，并保证整体特征提取器被覆盖。"""
         vit_wrap_policy = partial(_module_wrap_policy, module_classes={VisionTransformer})
         transformer_block_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
         return partial(_or_policy, policies=[vit_wrap_policy, transformer_block_policy])
 
     def forward(self, pixel_values: Union[torch.Tensor, Dict[str, torch.Tensor]]) -> torch.Tensor:
-        """Runs transformed image/pixel tensor through vision backbone, returning _all_ patch features."""
+        """将预处理后的图像张量送入视觉骨干，返回完整的 patch 表征。"""
         return self.featurizer(pixel_values)
 
     @property

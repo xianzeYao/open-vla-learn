@@ -62,6 +62,7 @@ class GenerateConfig:
     pretrained_checkpoint: Union[str, Path] = ""     # Pretrained checkpoint path
     load_in_8bit: bool = False                       # (For OpenVLA only) Load with 8-bit quantization
     load_in_4bit: bool = False                       # (For OpenVLA only) Load with 4-bit quantization
+    # 支持以低比特精度载入推理模型，降低显存占用
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
 
@@ -99,9 +100,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     # [OpenVLA] Set action un-normalization key
     cfg.unnorm_key = cfg.task_suite_name
+    # 根据任务套件名称选择动作反归一化参数，确保尺度匹配
 
     # Load model
     model = get_model(cfg)
+    # 载入策略模型，可兼容 OpenVLA 或其它模型族
 
     # [OpenVLA] Check that the model contains the action un-normalization key
     if cfg.model_family == "openvla":
@@ -115,6 +118,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     processor = None
     if cfg.model_family == "openvla":
         processor = get_processor(cfg)
+        # OpenVLA 通过 Processor 完成图像/文本编码，与训练流程保持一致
 
     # Initialize local logging
     run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"
@@ -124,6 +128,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     local_log_filepath = os.path.join(cfg.local_log_dir, run_id + ".txt")
     log_file = open(local_log_filepath, "w")
     print(f"Logging to local log file: {local_log_filepath}")
+    # 将评估过程中关键指标写入本地日志文件，便于离线追踪
 
     # Initialize Weights & Biases logging as well
     if cfg.use_wandb:
@@ -142,6 +147,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
+    # 统一计算观测图像的缩放尺寸，以匹配模型输入要求
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
@@ -151,9 +157,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
         # Get default LIBERO initial states
         initial_states = task_suite.get_task_init_states(task_id)
+        # 每个任务预设若干初始状态，模拟不同场景起点
 
         # Initialize LIBERO environment and task description
         env, task_description = get_libero_env(task, cfg.model_family, resolution=256)
+        # 创建具体的 LIBERO 任务环境，返回文字描述供策略生成提示
 
         # Start episodes
         task_episodes, task_successes = 0, 0
@@ -163,9 +171,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
             # Reset environment
             env.reset()
+            # 重置环境，保证从同一起点开始评估
 
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
+            # 应用本轮的初始状态，重现官方评测流程
 
             # Setup
             t = 0
@@ -194,9 +204,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
                     # Get preprocessed image
                     img = get_libero_image(obs, resize_size)
+                    # 提取和预处理摄像头画面，包含裁剪、缩放和归一化
 
                     # Save preprocessed image for replay video
                     replay_images.append(img)
+                    # 记录图像帧用于生成回放视频
 
                     # Prepare observations dict
                     # Note: OpenVLA does not take proprio state as input
@@ -206,6 +218,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                             (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
                         ),
                     }
+                    # 构造策略输入字典，包含视觉图像和关节状态
 
                     # Query model to get action
                     action = get_action(
@@ -215,14 +228,17 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         task_description,
                         processor=processor,
                     )
+                    # 调用统一的推理接口，结合文本任务描述生成下一步动作
 
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
                     action = normalize_gripper_action(action, binarize=True)
+                    # 将抓手开合量转换到环境期望的 [-1, 1] 范围
 
                     # [OpenVLA] The dataloader flips the sign of the gripper action to align with other datasets
                     # (0 = close, 1 = open), so flip it back (-1 = open, +1 = close) before executing the action
                     if cfg.model_family == "openvla":
                         action = invert_gripper_action(action)
+                        # OpenVLA 训练时约定与环境相反的符号，这里翻转回去
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
@@ -244,6 +260,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
             save_rollout_video(
                 replay_images, total_episodes, success=done, task_description=task_description, log_file=log_file
             )
+            # 输出视频与日志，记录是否成功完成任务
 
             # Log current results
             print(f"Success: {done}")

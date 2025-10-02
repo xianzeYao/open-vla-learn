@@ -23,7 +23,7 @@ from transformers import GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from prismatic.models.backbones.llm import LLMBackbone
-from prismatic.models.backbones.llm.prompting import PromptBuilder
+from prismatic.models.backbones.llm.prompting import PromptBuilder 
 from prismatic.models.backbones.vision import VisionBackbone
 
 

@@ -46,12 +46,14 @@ class HFConvertConfig:
     )
     output_hf_model_hub_path: str = "openvla/openvla-7b"                # (Optional) Path to HF Hub Path to push
                                                                         # model to
+    # 可指定本地导出目录与可选的 HF Hub 路径，便于后续上传
 
     # HF Hub Credentials (required for Gated Models like LLaMa-2)
     hf_token: Union[str, Path] = Path(".hf_token")                      # Environment variable or Path to HF Token
 
     def __post_init__(self) -> None:
         self.hf_token = self.hf_token.read_text().strip() if isinstance(self.hf_token, Path) else self.hf_token
+        # 将 HF token 归一化为字符串，后续下载受限模型时直接使用
 
     # fmt: on
 
@@ -67,6 +69,7 @@ def ls_apply_patch(ls_module: LayerScale):
     ls_module.scale_factor = nn.Parameter(ls_module.gamma.clone())
     ls_module.forward = _ls_new_forward.__get__(ls_module, LayerScale)
     del ls_module.gamma
+    # 为兼容 transformers 的权重命名，这里手动重写 LayerScale 的参数与前向逻辑
 
 
 # === Conversion Constants ===
@@ -92,6 +95,7 @@ def remap_state_dicts_for_hf(
     # Iterate through Projector =>> use `PROJECTOR_KEY_MAPPING`
     for key, value in projector_state_dict.items():
         hf_state_dict[PROJECTOR_KEY_MAPPING[key]] = value
+        # 投影层命名与 HF 定义不一致，需要逐项映射
 
     # Iterate through LLM Backbone =>> replace `llm.` with `language_model.`
     for key, value in llm_backbone_state_dict.items():
@@ -113,12 +117,14 @@ def remap_state_dicts_for_hf(
                 hf_state_dict[key.replace("siglip_featurizer.", "vision_backbone.fused_featurizer.")] = value
 
     return hf_state_dict
+    # 整合视觉、投影、语言模块的权重，使其符合 HF 模型的层级命名
 
 
 @draccus.wrap()
 def convert_openvla_weights_to_hf(cfg: HFConvertConfig) -> None:
     print(f"[*] Converting OpenVLA Model `{cfg.openvla_model_path_or_id}` to HF Transformers Format")
     torch.set_default_dtype(torch.bfloat16)
+    # 转换流程默认以 bf16 精度运行，避免不必要的精度损失
 
     # Get `config.json`, 'dataset_statistics.json' and `checkpoint_pt` -- mirrors logic in `prismatic.models.load.py`
     if os.path.isdir(cfg.openvla_model_path_or_id):
@@ -138,6 +144,7 @@ def convert_openvla_weights_to_hf(cfg: HFConvertConfig) -> None:
         dataset_statistics_json = hf_hub_download(
             "openvla/openvla-dev", f"{cfg.openvla_model_path_or_id}/dataset_statistics.json"
         )
+        # 若输入为远程模型 ID，则从 HF Hub 下载相同结构的配置、权重与统计信息
 
     # Load "Native" Config JSON =>> Create LLM Config & Instantiate Tokenizer
     with open(config_json, "r") as f:
@@ -158,6 +165,7 @@ def convert_openvla_weights_to_hf(cfg: HFConvertConfig) -> None:
         torch_dtype=torch.bfloat16,
         norm_stats=norm_stats,
     )
+    # 借助训练时的配置构造 HF 版本的模型描述，保证结构完全一致
 
     # Instantiate & Add Pad to Tokenizer =>> following `prismatic.models.materialize.get_llm_backbone_and_tokenizer`
     #   TODO (siddk) :: Implement batched generation -- in which case this should set `padding_side = "left"`!
@@ -169,6 +177,7 @@ def convert_openvla_weights_to_hf(cfg: HFConvertConfig) -> None:
     tokenizer.init_kwargs.pop("add_prefix_space", None)  # Pop to prevent unnecessary warning on reload...
     assert tokenizer.pad_token_id == hf_config.pad_token_id, "Incorrect Pad Token ID!"
     assert len(tokenizer) > hf_config.text_config.vocab_size, "Tokenizer vocabulary must be larger than LLM vocabulary!"
+    # 补齐 pad token 后需要更新 LLM 配置中的词表大小与 pad ID
 
     # Patch LLM Config in `hf_config` with vocab_size (+ `hf_config.pad_to_multiple_of`), pad_token_id + validate
     hf_config.text_config.vocab_size += hf_config.pad_to_multiple_of
@@ -200,6 +209,7 @@ def convert_openvla_weights_to_hf(cfg: HFConvertConfig) -> None:
         for module in timm_vision_backbone.modules():
             if isinstance(module, LayerScale):
                 ls_apply_patch(module)
+        # 遍历所有视觉骨干模块，确保 LayerScale 已应用补丁
 
     # Create PrismaticImageProcessor (`transformers.ImageProcessingMixin`)
     hf_image_processor = PrismaticImageProcessor(
@@ -214,6 +224,7 @@ def convert_openvla_weights_to_hf(cfg: HFConvertConfig) -> None:
     # Create top-level PrismaticProcessor (`transformers.ProcessorMixin` =>> enables registry w/ AutoProcessor)
     print("[*] Creating PrismaticProcessor Instance from Tokenizer and PrismaticImageProcessor")
     hf_processor = PrismaticProcessor(image_processor=hf_image_processor, tokenizer=tokenizer)
+    # Processor 封装了图像预处理与文本 tokenizer，便于推理时统一调用
 
     # Load Prismatic Model State Dictionary (in preparation for conversion)
     print("[*] Loading Prismatic VLM State Dictionary from Checkpoint")
@@ -229,11 +240,13 @@ def convert_openvla_weights_to_hf(cfg: HFConvertConfig) -> None:
         model_state_dict["llm_backbone"],
         use_fused_vision_backbone=hf_config.use_fused_vision_backbone,
     )
+    # 将原生 Prismatic 的分模块权重转换为 HF 标准的扁平命名
 
     # Create PrismaticForConditionalGeneration =>> Note that we can't initialize on `meta` device because TIMM
     print("[*] Building (Randomly Initialized) Model =>> OpenVLAForActionPrediction")
     hf_model = OpenVLAForActionPrediction(hf_config)
     hf_model.load_state_dict(converted_state_dict, strict=True, assign=True)
+    # 实例化 HF 版本模型并加载转换后的权重，确保严格匹配
 
     # Cast Model to BF16 before Saving
     hf_model.to(torch.bfloat16)
@@ -243,10 +256,12 @@ def convert_openvla_weights_to_hf(cfg: HFConvertConfig) -> None:
     hf_model.save_pretrained(cfg.output_hf_model_local_path, max_shard_size="7GB")
     hf_image_processor.save_pretrained(cfg.output_hf_model_local_path)
     hf_processor.save_pretrained(cfg.output_hf_model_local_path)
+    # 同目录下保存模型、图像处理器与总 Processor，方便直接通过 Auto* 类加载
 
     # Copy `dataset_statistics.json` File to Converted Checkpoint Directory
     output_dataset_statistics_json = cfg.output_hf_model_local_path / "dataset_statistics.json"
     shutil.copyfile(dataset_statistics_json, output_dataset_statistics_json)
+    # 同步导出动作归一化统计，确保部署时行为一致
 
     print(f"[*] Saving Complete! Saved converted checkpoint to: {cfg.output_hf_model_local_path}")
 
