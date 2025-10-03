@@ -99,7 +99,7 @@ class PaddedCollatorForActionPrediction:
     pixel_values_dtype: torch.dtype = torch.float32  # 图像张量的默认数据类型
 
 
-    # 把经过处理过的最原始的数据的基础上，一个。把一个batch
+    # 把经过处理过的最原始的数据的基础上，一个。把一个batch里的样本统一格式化一下，即变成标准张量
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         # Step 1：分别收集 input_ids、labels 以及 pixel_values 列表
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))

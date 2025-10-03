@@ -42,36 +42,38 @@ class RLDSBatchTransform:
         dataset_name  = rlds_batch["dataset_name"]
         action = rlds_batch["action"][0]
         img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
-        lang = rlds_batch["task"]["language_instruction"].decode().lower()
+        lang = rlds_batch["task"]["language_instruction"].decode().lower() # 这里的decode不是编码，而是将btyes转为str
 
         # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
         # Step 2：构造对话式提示词，其中回答部分直接使用离散化后的动作 token
         prompt_builder = self.prompt_builder_fn("openvla")
         conversation = [
-            {"from": "human", "value": f"What action should the robot take to {lang}?"},
-            {"from": "gpt", "value": self.action_tokenizer(action)},
+            {"from": "human", "value": f"What action should the robot take to {lang}?"}, # lang代表语言指令
+            {"from": "gpt", "value": self.action_tokenizer(action)}, # 将其机器人动作编码为词表末尾token
         ]
         for turn in conversation:
             prompt_builder.add_turn(turn["from"], turn["value"])
 
         # Tokenize (w/ `base_tokenizer`)
         # Step 3：使用基础 tokenizer 编码文本提示，得到 input_ids 与初始 labels
-        input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids
-        labels = list(input_ids)
+        input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids # 所有prompt内容编码为tokenid
+        labels = list(input_ids) #列表形式tokenid，后续把不需要监督的位置给消掉
 
         # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
         #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
-        # Step 4：转为张量；图像经过 image_transform 得到 pixel_values
+        # Step 4：转为张量；文本，图像经过都经过处理得到张量
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
         pixel_values = self.image_transform(img)
 
         # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
+        # 只计算动作预测token的损失，重点在这个上面
         # Step 5：除动作 token 以外的部分全部设置为 IGNORE_INDEX；若不预测 stop_token，则最后一位也忽略
-        labels[: -(len(action) + 1)] = IGNORE_INDEX
+        labels[: -(len(action) + 1)] = IGNORE_INDEX # 倒数len(action)个动作token+1个结束token位以外的都打上忽略的标签
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
         return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name)
+        # 所以整理好的数据集就一个字典对(处理过的图片张量，输入prompt对应tokenid的张量，每个token标签，数据集名字)
 
 
 class RLDSDataset(IterableDataset):

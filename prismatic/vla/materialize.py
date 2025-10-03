@@ -36,7 +36,7 @@ def get_vla_dataset_and_collator(
     """Initialize RLDS Dataset (wraps TFDS), ActionTokenizer, and initialize transform/collation functions."""
     # Step 1：构建动作 tokenizer，确保动作离散化与语言 tokenizer 的特殊符号保持一致
     action_tokenizer = ActionTokenizer(tokenizer)
-    # Step 2：构建 batch_transform，将单条 RLDS 样本转换为模型输入（图像、文本、动作标签）
+    # Step 2：构建 batch_transform，将单条 RLDS 样本转换为模型输入
     batch_transform = RLDSBatchTransform(
         action_tokenizer,
         tokenizer,
@@ -45,11 +45,13 @@ def get_vla_dataset_and_collator(
         predict_stop_token=predict_stop_token,
     )
     # Step 3：构建 collator，在 DataLoader 层完成 padding、mask 构建和标签对齐
+    # 只是实例化一下collator
     collator = PaddedCollatorForActionPrediction(
         tokenizer.model_max_length, tokenizer.pad_token_id, padding_side=padding_side
     )
 
     # Step 4：根据是否按 episode 输出决定使用普通 RLDSDataset 或 EpisodicRLDSDataset
+    # episodic为True则就是一个完整的任务序列，反之则是一步步的动作
     cls = RLDSDataset if not episodic else EpisodicRLDSDataset
     dataset = cls(
         data_root_dir,

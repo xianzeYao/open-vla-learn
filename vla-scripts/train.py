@@ -212,7 +212,6 @@ def train(cfg: TrainConfig) -> None:
         shuffle_buffer_size=cfg.vla.shuffle_buffer_size,  # RLDS 数据混合使用的乱序缓冲区
         image_aug=cfg.image_aug,
     )
-    # action_tokenizer 将连续动作离散化，collator 负责 PAD 与掩码以适配自回归训练
 
     # 保存数据集统计信息，供推理阶段反归一化动作使用
     if overwatch.is_rank_zero():

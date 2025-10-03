@@ -3,6 +3,8 @@ finetune.py
 
 Simple script for parameter-efficient fine-tuning of OpenVLA models loaded through the HuggingFace AutoClasses, using
 HuggingFace PEFT library for low-rank adaptation (LoRA).
+简述：基于 HF AutoClasses 加载 OpenVLA，并用 PEFT 的 LoRA 在小数据/低显存场景下进行参数高效微调；
+同时支持可选的 4bit 量化与多卡 DDP 训练、按步保存与合并适配器权重。
 
 Notes & Benchmarks:
     - Requires PEFT (`pip install peft==0.11.1`)
@@ -19,39 +21,38 @@ Run with:
                                     ...
 """
 
-import os
-from collections import deque
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
+import os  # 与实验目录、环境变量相关的工具函数
+from collections import deque  # 简单滑窗数据结构，用于平滑指标
+from dataclasses import dataclass  # 定义配置 dataclass
+from pathlib import Path  # 平台无关的文件路径操作
+from typing import Optional  # 类型注解：可选值
 
-import draccus
-import torch
-import torch.distributed as dist
-import tqdm
-from accelerate import PartialState
-from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim import AdamW
-from torch.utils.data import DataLoader
-from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
-from transformers import AutoConfig, AutoImageProcessor
-from transformers.modeling_outputs import CausalLMOutputWithPast
+import draccus  # 将 dataclass 映射为命令行参数/配置文件
+import torch  # 核心张量与自动求导库
+import torch.distributed as dist  # PyTorch 分布式通信原语
+import tqdm  # 控制台进度条
+from accelerate import PartialState  # Accelerate 的轻量分布式状态封装
+from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training  # PEFT/LoRA 核心 API
+from torch.nn.parallel import DistributedDataParallel as DDP  # PyTorch 原生 DDP 包装器
+from torch.optim import AdamW  # 经典 AdamW 优化器
+from torch.utils.data import DataLoader  # 数据加载器
+from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig  # Vision2Seq 模型及 4bit 配置
+from transformers import AutoConfig, AutoImageProcessor  # 注册 AutoClasses 时需要
+from transformers.modeling_outputs import CausalLMOutputWithPast  # HF 自回归模型的输出结构（含 loss/logits）
 
-import wandb
-from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
-from prismatic.util.data_utils import PaddedCollatorForActionPrediction
-from prismatic.vla.action_tokenizer import ActionTokenizer
-from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
-from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+import wandb  # Weights & Biases 日志追踪
+from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder  # Prompt 构造器
+from prismatic.util.data_utils import PaddedCollatorForActionPrediction  # 动作预测专用 collator
+from prismatic.vla.action_tokenizer import ActionTokenizer  # 连续动作 ↔ 离散 token
+from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset  # RLDS 数据集与批量变换
+from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics  # 保存数据统计（反归一化用）
 
-from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
-from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
-from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig  # HF AutoConfig 注册
+from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction  # HF 推理模型类
+from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor  # HF 处理器
 
 # Sane Defaults
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-# 禁用 tokenizer 的并行化警告，避免控制台输出干扰训练日志
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # 禁用 tokenizer 并行化警告，保持日志干净
 
 
 # # === Utilities ===
@@ -76,94 +77,81 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 @dataclass
 class FinetuneConfig:
     # fmt: off
-    vla_path: str = "openvla/openvla-7b"                            # Path to OpenVLA model (on HuggingFace Hub)
-    # 默认从 HuggingFace 上的官方 OpenVLA 权重出发，可改为本地目录
+    vla_path: str = "openvla/openvla-7b"                            # 要微调的 OpenVLA 模型路径（Hub/本地均可）
 
     # Directory Paths
-    data_root_dir: Path = Path("datasets/open-x-embodiment")        # Path to Open-X dataset directory
-    dataset_name: str = "droid_wipe"                                # Name of fine-tuning dataset (e.g., `droid_wipe`)
-    # 对应 RLDS 数据集中子任务的名称，影响加载的数据混合
-    run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
-    adapter_tmp_dir: Path = Path("adapter-tmp")                     # Temporary directory for LoRA weights before fusing
-    # LoRA 训练时会先把适配器参数单独保存，再按需合并回全量模型
+    data_root_dir: Path = Path("datasets/open-x-embodiment")        # RLDS 数据所在根目录
+    dataset_name: str = "droid_wipe"                                # 子数据集名称（决定加载的任务）
+    run_root_dir: Path = Path("runs")                               # 微调日志与权重的保存目录
+    adapter_tmp_dir: Path = Path("adapter-tmp")                     # LoRA 适配器临时目录（合并前存放）
 
     # Fine-tuning Parameters
-    batch_size: int = 16                                            # Fine-tuning batch size
-    max_steps: int = 200_000                                        # Max number of fine-tuning steps
-    save_steps: int = 5000                                          # Interval for checkpoint saving
-    learning_rate: float = 5e-4                                     # Fine-tuning learning rate
-    grad_accumulation_steps: int = 1                                # Gradient accumulation steps
-    image_aug: bool = True                                          # Whether to train with image augmentations
-    shuffle_buffer_size: int = 100_000                              # Dataloader shuffle buffer size (can reduce if OOM)
-    save_latest_checkpoint_only: bool = True                        # Whether to save only one checkpoint per run and
-                                                                    #   continually overwrite the latest checkpoint
-                                                                    #   (If False, saves all checkpoints)
-    # 默认为只保留最近一次检查点，节省磁盘；设为 False 可保留完整快照
+    batch_size: int = 16                                            # 单进程/单卡 batch 大小
+    max_steps: int = 200_000                                        # 最多训练多少个梯度步
+    save_steps: int = 5000                                          # 每隔多少步保存检查点
+    learning_rate: float = 5e-4                                     # AdamW 学习率
+    grad_accumulation_steps: int = 1                                # 梯度累积步数（>1 可扩大有效 batch）
+    image_aug: bool = True                                          # 是否开启图像增强
+    shuffle_buffer_size: int = 100_000                              # RLDS 数据的 shuffle 缓冲区
+    save_latest_checkpoint_only: bool = True                        # True=只保留最近一次检查点
 
     # LoRA Arguments
-    use_lora: bool = True                                           # Whether to use LoRA fine-tuning
-    lora_rank: int = 32                                             # Rank of LoRA weight matrix
-    lora_dropout: float = 0.0                                       # Dropout applied to LoRA weights
-    use_quantization: bool = False                                  # Whether to 4-bit quantize VLA for LoRA fine-tuning
-                                                                    #   => CAUTION: Reduces memory but hurts performance
+    use_lora: bool = True                                           # 是否启用 LoRA 微调
+    lora_rank: int = 32                                             # LoRA 低秩矩阵的秩 r
+    lora_dropout: float = 0.0                                       # LoRA 适配器 dropout
+    use_quantization: bool = False                                  # 是否 4bit 量化 LoRA 模型（节省显存）
 
     # Tracking Parameters
-    wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
-    wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
-    run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
-
+    wandb_project: str = "openvla"                                  # W&B 项目名
+    wandb_entity: str = "stanford-voltron"                          # W&B 工作区
+    run_id_note: Optional[str] = None                               # 额外标记（附加到 run_id）
     # fmt: on
 
 
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
-    print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
-    # 微调入口，主要流程包括加载基础模型、构建 RLDS 数据流、运行 LoRA 优化循环
+    print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")  # 打印微调基本信息
 
-    # [Validate] Ensure GPU Available & Set Device / Distributed Context
-    assert torch.cuda.is_available(), "Fine-tuning assumes at least one GPU is available!"
-    distributed_state = PartialState()
-    # Accelerate 提供的分布式上下文，统一处理多卡通信与主进程判定
-    torch.cuda.set_device(device_id := distributed_state.local_process_index)
-    torch.cuda.empty_cache()
+    assert torch.cuda.is_available(), "Fine-tuning assumes at least one GPU is available!"  # 确保至少有 1 张 GPU
+    distributed_state = PartialState()  # 构建分布式状态，获取 local_process_index 等
+    torch.cuda.set_device(device_id := distributed_state.local_process_index)  # 设置当前进程使用的 GPU
+    torch.cuda.empty_cache()  # 清理显存碎片
 
-    # Configure Unique Experiment ID & Log Directory
-    exp_id = (
+    exp_id = (  # 组装实验 ID（模型名+数据集+有效 batch+学习率）
         f"{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
         f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
         f"+lr-{cfg.learning_rate}"
     )
     if cfg.use_lora:
-        exp_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
+        exp_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"  # 标记 LoRA 配置
     if cfg.use_quantization:
-        exp_id += "+q-4bit"
+        exp_id += "+q-4bit"  # 标记 4bit 量化
     if cfg.run_id_note is not None:
-        exp_id += f"--{cfg.run_id_note}"
+        exp_id += f"--{cfg.run_id_note}"  # 附加自定义标记
     if cfg.image_aug:
-        exp_id += "--image_aug"
+        exp_id += "--image_aug"  # 记录是否使用图像增强
 
-    # Start =>> Build Directories
-    run_dir, adapter_dir = cfg.run_root_dir / exp_id, cfg.adapter_tmp_dir / exp_id
-    os.makedirs(run_dir, exist_ok=True)
-    # 微调运行目录与 LoRA 临时权重目录按实验 ID 区分，方便多组实验并存
+    run_dir = cfg.run_root_dir / exp_id  # 日志与权重保存目录
+    adapter_dir = cfg.adapter_tmp_dir / exp_id  # LoRA 适配器临时目录
+    os.makedirs(run_dir, exist_ok=True)  # 创建输出目录
+    os.makedirs(adapter_dir, exist_ok=True)  # 创建适配器目录
 
-    # Quantization Config =>> only if LoRA fine-tuning
-    quantization_config = None
-    if cfg.use_quantization:
-        assert cfg.use_lora, "Quantized training only supported for LoRA fine-tuning!"
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_quant_type="nf4"
+    quantization_config = None  # 默认不量化
+    if cfg.use_quantization:  # 开启 4bit 量化
+        assert cfg.use_lora, "Quantized training only supported for LoRA fine-tuning!"  # 限制：只有 LoRA 场景使用
+        quantization_config = BitsAndBytesConfig(  # NF4 低比特配置
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
         )
 
-    # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
-    AutoConfig.register("openvla", OpenVLAConfig)
-    AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
-    AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-    AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+    AutoConfig.register("openvla", OpenVLAConfig)  # 注册 OpenVLA 配置类，供 AutoConfig 使用
+    AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)  # 注册自定义图像处理器
+    AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)  # 注册同时处理图像/文本的 Processor
+    AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)  # 注册模型类
 
-    # Load OpenVLA Processor and Model using HF AutoClasses
-    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
-    vla = AutoModelForVision2Seq.from_pretrained(
+    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)  # 加载图像处理 + tokenizer
+    vla = AutoModelForVision2Seq.from_pretrained(  # 加载 VLA 模型
         cfg.vla_path,
         torch_dtype=torch.bfloat16,
         quantization_config=quantization_config,
@@ -171,60 +159,41 @@ def finetune(cfg: FinetuneConfig) -> None:
         trust_remote_code=True,
     )
 
-    # Device Placement =>> note that BitsAndBytes automatically handles for quantized training
     if cfg.use_quantization:
-        vla = prepare_model_for_kbit_training(vla)
+        vla = prepare_model_for_kbit_training(vla)  # 4bit 场景：冻结规范层、准备量化训练
     else:
-        vla = vla.to(device_id)
+        vla = vla.to(device_id)  # 非量化：直接送入目标 GPU
 
-    # [LoRA] Wrap Model w/ PEFT `LoraConfig` =>> by default we set `target_modules=all-linear`
     if cfg.use_lora:
-        lora_config = LoraConfig(
+        lora_config = LoraConfig(  # LoRA 配置
             r=cfg.lora_rank,
             lora_alpha=min(cfg.lora_rank, 16),
             lora_dropout=cfg.lora_dropout,
             target_modules="all-linear",
             init_lora_weights="gaussian",
         )
-        vla = get_peft_model(vla, lora_config)
-        vla.print_trainable_parameters()
+        vla = get_peft_model(vla, lora_config)  # 注入 LoRA 适配器
+        vla.print_trainable_parameters()  # 打印可训练参数比例（便于确认注入结果）
 
-    # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
-    vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
-    # 包装成 DDP 以支持多 GPU，同步梯度并减少显存碎片
+    vla = DDP(  # 用 DDP 包装模型，支持多 GPU 训练
+        vla,
+        device_ids=[device_id],
+        find_unused_parameters=True,
+        gradient_as_bucket_view=True,
+    )
 
-    # Create Optimizer =>> note that we default to a simple constant learning rate!
-    trainable_params = [param for param in vla.parameters() if param.requires_grad]
-    optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
-    # LoRA 只针对 trainable 参数求梯度，AdamW 负责更新
+    trainable_params = [param for param in vla.parameters() if param.requires_grad]  # 收集可训练参数
+    optimizer = AdamW(trainable_params, lr=cfg.learning_rate)  # 设置优化器（可按需加 weight_decay）
 
-    # Create Action Tokenizer
-    action_tokenizer = ActionTokenizer(processor.tokenizer)
-    # ActionTokenizer 把连续控制信号映射到离散 token，保持与语言模型输出空间一致
+    action_tokenizer = ActionTokenizer(processor.tokenizer)  # 根据 tokenizer 构建动作离散化器
 
-    # Load Fine-tuning Dataset =>> note that we use an RLDS-formatted dataset following Open X-Embodiment by default.
-    #   =>> If you want to use a non-RLDS dataset (e.g., a standard PyTorch Dataset) see the following commented block.
-    #   =>> Note that our training code does not loop over epochs because the RLDS loader does this implicitly; if using
-    #       your own Dataset, make sure to add the appropriate logic to the training loop!
-    #
-    # ---
-    # from prismatic.vla.datasets import DummyDataset
-    #
-    # vla_dataset = DummyDataset(
-    #     action_tokenizer,
-    #     processor.tokenizer,
-    #     image_transform=processor.image_processor.apply_transform,
-    #     prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
-    # )
-    # ---
-    batch_transform = RLDSBatchTransform(
+    batch_transform = RLDSBatchTransform(  # RLDS 批量转换：图像预处理 + prompt + 动作 token
         action_tokenizer,
         processor.tokenizer,
         image_transform=processor.image_processor.apply_transform,
         prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
     )
-    # RLDSBatchTransform 负责拼接图像、语言提示与动作标签，形成自回归监督信号
-    vla_dataset = RLDSDataset(
+    vla_dataset = RLDSDataset(  # 构建 RLDS IterableDataset
         cfg.data_root_dir,
         cfg.dataset_name,
         batch_transform,
@@ -233,94 +202,75 @@ def finetune(cfg: FinetuneConfig) -> None:
         image_aug=cfg.image_aug,
     )
 
-    # [Important] Save Dataset Statistics =>> used to de-normalize actions for inference!
     if distributed_state.is_main_process:
-        save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)
-        # 保存归一化统计，推理时可还原动作尺度
+        save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)  # 保存数据归一化统计
 
-    # Create Collator and DataLoader
-    collator = PaddedCollatorForActionPrediction(
-        processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
+    collator = PaddedCollatorForActionPrediction(  # 构建 collator：负责 padding 与 mask
+        processor.tokenizer.model_max_length,
+        processor.tokenizer.pad_token_id,
+        padding_side="right",
     )
-    dataloader = DataLoader(
+    dataloader = DataLoader(  # 构建 DataLoader；RLDS 内部已并行因此 num_workers=0
         vla_dataset,
         batch_size=cfg.batch_size,
         sampler=None,
         collate_fn=collator,
-        num_workers=0,  # Important =>> Set to 0 if using RLDS; TFDS rolls its own parallelism!
+        num_workers=0,
+        worker_init_fn=None,  # 如需自定义 worker 初始化，可在此添加回调
     )
-    # RLDS 数据集内部已经处理并行 IO，这里保持单线程避免与 TFDS 竞争
 
-    # Initialize Logging =>> W&B
     if distributed_state.is_main_process:
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}")
-        # 仅主进程写 W&B，避免重复创建多份 run
+        wandb.init(  # 初始化 W&B 追踪
+            entity=cfg.wandb_entity,
+            project=cfg.wandb_project,
+            name=f"ft+{exp_id}",
+        )
 
-    # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
-    recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
-    recent_action_accuracies = deque(maxlen=cfg.grad_accumulation_steps)
-    recent_l1_losses = deque(maxlen=cfg.grad_accumulation_steps)
-    # 最近窗口内的指标用于平滑显示，避免因梯度累积而产生噪声
+    recent_losses = deque(maxlen=cfg.grad_accumulation_steps)  # 用于平滑 loss
+    recent_action_accuracies = deque(maxlen=cfg.grad_accumulation_steps)  # 平滑动作准确率
+    recent_l1_losses = deque(maxlen=cfg.grad_accumulation_steps)  # 平滑 L1 误差
 
-    # Train!
-    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
-        vla.train()
-        optimizer.zero_grad()
-        for batch_idx, batch in enumerate(dataloader):
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                output: CausalLMOutputWithPast = vla(
+    with tqdm.tqdm(total=cfg.max_steps, leave=False, disable=not distributed_state.is_main_process) as progress:
+        vla.train()  # 模型设为训练模式
+        optimizer.zero_grad()  # 清空梯度
+        for batch_idx, batch in enumerate(dataloader):  # 迭代 RLDS 数据，直到达到 max_steps
+            with torch.autocast("cuda", dtype=torch.bfloat16):  # 开启 BF16 混合精度
+                output: CausalLMOutputWithPast = vla(  # 前向传播返回 HF 自回归输出
                     input_ids=batch["input_ids"].to(device_id),
                     attention_mask=batch["attention_mask"].to(device_id),
                     pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
                     labels=batch["labels"],
                 )
-                loss = output.loss
+                loss = output.loss  # HF 内部交叉熵损失（仅动作 token 区域参与）
 
-            # Normalize loss to account for gradient accumulation
-            normalized_loss = loss / cfg.grad_accumulation_steps
-            # 按累积步数缩放 loss，保证等效的全局学习率
+            normalized_loss = loss / cfg.grad_accumulation_steps  # 按累积步数缩放 loss
+            normalized_loss.backward()  # 反向传播（梯度由 DDP 管理）
 
-            # Backward pass
-            normalized_loss.backward()
-            # 反向传播由 DDP 管理梯度同步
-
-            # Compute Accuracy and L1 Loss for Logging
             action_logits = output.logits[:, vla.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
-            action_preds = action_logits.argmax(dim=2)
-            action_gt = batch["labels"][:, 1:].to(action_preds.device)
-            mask = action_gt > action_tokenizer.action_token_begin_idx
-
-            # Compute Accuracy
-            correct_preds = (action_preds == action_gt) & mask
-            action_accuracy = correct_preds.sum().float() / mask.sum().float()
-
-            # Compute L1 Loss on Predicted (Continuous) Actions
+            action_preds = action_logits.argmax(dim=2)  # 动作 token 预测
+            action_gt = batch["labels"][:, 1:].to(action_preds.device)  # 去掉 BOS 与预测对齐
+            mask = action_gt > action_tokenizer.action_token_begin_idx  # 仅统计动作 token 区域
+            correct_preds = (action_preds == action_gt) & mask  # 每个 token 是否预测正确
+            action_accuracy = correct_preds.sum().float() / mask.sum().float()  # 动作 token 准确率
             continuous_actions_pred = torch.tensor(
                 action_tokenizer.decode_token_ids_to_actions(action_preds[mask].cpu().numpy())
             )
             continuous_actions_gt = torch.tensor(
                 action_tokenizer.decode_token_ids_to_actions(action_gt[mask].cpu().numpy())
             )
-            action_l1_loss = torch.nn.functional.l1_loss(continuous_actions_pred, continuous_actions_gt)
+            action_l1_loss = torch.nn.functional.l1_loss(continuous_actions_pred, continuous_actions_gt)  # 连续动作 L1
 
-            # Store recent train metrics
-            recent_losses.append(loss.item())
-            recent_action_accuracies.append(action_accuracy.item())
-            recent_l1_losses.append(action_l1_loss.item())
+            recent_losses.append(loss.item())  # 记录当前 step loss
+            recent_action_accuracies.append(action_accuracy.item())  # 记录动作准确率
+            recent_l1_losses.append(action_l1_loss.item())  # 记录 L1
 
-            # Compute gradient step index
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
+            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps  # 当前梯度步编号
+            smoothened_loss = sum(recent_losses) / len(recent_losses)  # 平滑 loss
+            smoothened_action_accuracy = sum(recent_action_accuracies) / len(recent_action_accuracies)  # 平滑准确率
+            smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)  # 平滑 L1
 
-            # Compute smoothened train metrics
-            #   =>> Equal to current step metrics when not using gradient accumulation
-            #   =>> Otherwise, equal to the average of metrics observed over micro-batches used for gradient accumulation
-            smoothened_loss = sum(recent_losses) / len(recent_losses)
-            smoothened_action_accuracy = sum(recent_action_accuracies) / len(recent_action_accuracies)
-            smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)
-
-            # Push Metrics to W&B (every 10 gradient steps)
             if distributed_state.is_main_process and gradient_step_idx % 10 == 0:
-                wandb.log(
+                wandb.log(  # 每 10 个梯度步推送一次 W&B 指标
                     {
                         "train_loss": smoothened_loss,
                         "action_accuracy": smoothened_action_accuracy,
@@ -329,67 +279,46 @@ def finetune(cfg: FinetuneConfig) -> None:
                     step=gradient_step_idx,
                 )
 
-            # Optimizer Step
-            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:  # 达到累积步，执行优化器更新
                 optimizer.step()
                 optimizer.zero_grad()
-                progress.update()
-                # 达到梯度累积的步长后执行一次参数更新
+                if distributed_state.is_main_process:
+                    progress.update()  # 更新进度条
 
-            # Save Model Checkpoint =>> by default, only keeps the latest checkpoint, continually overwriting it!
-            if gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0:
+            if gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0:  # 到达保存间隔
                 if distributed_state.is_main_process:
                     print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
+                    save_dir = adapter_dir if cfg.use_lora else run_dir  # LoRA：先保存适配器
+                    processor.save_pretrained(run_dir)  # 保存处理器（图像+tokenizer）
+                    vla.module.save_pretrained(save_dir)  # 保存模型/适配器权重
+                dist.barrier()  # 等待主进程写完
 
-                    # If LoRA, we first save adapter weights, then merge into full model; otherwise, default save!
-                    save_dir = adapter_dir if cfg.use_lora else run_dir
-
-                    # Save Processor & Weights
-                    processor.save_pretrained(run_dir)
-                    vla.module.save_pretrained(save_dir)
-                    # LoRA 模式下先把适配器权重单独输出，后续再合并
-
-                # Wait for processor and adapter weights to be saved by main process
-                dist.barrier()
-                # 等待主进程完成权重写出，确保其它进程不会提前继续
-
-                # Merge LoRA weights into model backbone for faster inference
-                #   =>> Note that merging is slow and can be done post-hoc to speed up training
-                if cfg.use_lora:
+                if cfg.use_lora:  # LoRA 额外合并适配器 → 完整模型
                     base_vla = AutoModelForVision2Seq.from_pretrained(
-                        cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+                        cfg.vla_path,
+                        torch_dtype=torch.bfloat16,
+                        low_cpu_mem_usage=True,
+                        trust_remote_code=True,
                     )
                     merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
                     merged_vla = merged_vla.merge_and_unload()
                     if distributed_state.is_main_process:
                         if cfg.save_latest_checkpoint_only:
-                            # Overwrite latest checkpoint
-                            merged_vla.save_pretrained(run_dir)
-
+                            merged_vla.save_pretrained(run_dir)  # 覆写最新合并后权重
                             print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {run_dir}")
                         else:
-                            # Prepare to save checkpoint in new directory
                             checkpoint_dir = Path(str(run_dir) + f"--{gradient_step_idx}_chkpt")
                             os.makedirs(checkpoint_dir, exist_ok=True)
-
-                            # Save dataset statistics to new directory
                             save_dataset_statistics(vla_dataset.dataset_statistics, checkpoint_dir)
-
-                            # Save processor and model weights to new directory
                             processor.save_pretrained(checkpoint_dir)
                             merged_vla.save_pretrained(checkpoint_dir)
-                            # 当需要保留历史权重时，为每个步数创建独立目录
-
                             print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {checkpoint_dir}")
+                dist.barrier()  # 所有进程同步
 
-                # Block on Main Process Checkpointing
-                dist.barrier()
-
-            # Stop training when max_steps is reached
-            if gradient_step_idx == cfg.max_steps:
+            if gradient_step_idx == cfg.max_steps:  # 达到最大步数即终止
                 print(f"Max step {cfg.max_steps} reached! Stopping training...")
                 break
 
 
 if __name__ == "__main__":
-    finetune()
+    finetune()  # 入口：draccus.wrap 会自动解析 CLI 参数并调用
