@@ -17,30 +17,30 @@ Usage:
         --wandb_entity <ENTITY>
 """
 
-import os
-import sys
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, Union
+import os  # 文件与日志路径管理
+import sys  # 修改 sys.path 以便导入上级目录模块
+from dataclasses import dataclass  # 配置结构体
+from pathlib import Path  # 跨平台路径操作
+from typing import Optional, Union  # 类型注解：可选值/联合类型
 
-import draccus
-import numpy as np
-import tqdm
-from libero.libero import benchmark
+import draccus  # 将 dataclass 暴露为命令行参数
+import numpy as np  # 数值运算库
+import tqdm  # 任务进度条
+from libero.libero import benchmark  # 官方 LIBERO benchmark 接口
 
-import wandb
+import wandb  # Weights & Biases 日志
 
-# Append current directory so that interpreter can find experiments.robot
+# 让解释器能找到 experiments.robot 包（相对路径上移两级）
 sys.path.append("../..")
-from experiments.robot.libero.libero_utils import (
-    get_libero_dummy_action,
-    get_libero_env,
-    get_libero_image,
-    quat2axisangle,
-    save_rollout_video,
+from experiments.robot.libero.libero_utils import (  # LIBERO 评估工具函数
+    get_libero_dummy_action,  # 获取“空动作”用于等待阶段
+    get_libero_env,  # 构建 LIBERO 环境
+    get_libero_image,  # 图像预处理与缩放
+    quat2axisangle,  # 四元数 → 轴角转换
+    save_rollout_video,  # 保存回放视频
 )
-from experiments.robot.openvla_utils import get_processor
-from experiments.robot.robot_utils import (
+from experiments.robot.openvla_utils import get_processor  # OpenVLA Processor 加载工具
+from experiments.robot.robot_utils import (  # 机器人通用工具（动作归一化、模型加载等）
     DATE_TIME,
     get_action,
     get_image_resize_size,
@@ -58,197 +58,146 @@ class GenerateConfig:
     #################################################################################################################
     # Model-specific parameters
     #################################################################################################################
-    model_family: str = "openvla"                    # Model family
-    pretrained_checkpoint: Union[str, Path] = ""     # Pretrained checkpoint path
-    load_in_8bit: bool = False                       # (For OpenVLA only) Load with 8-bit quantization
-    load_in_4bit: bool = False                       # (For OpenVLA only) Load with 4-bit quantization
-    # 支持以低比特精度载入推理模型，降低显存占用
+    model_family: str = "openvla"                    # 使用的模型族（默认 openvla，可扩展到其他策略）
+    pretrained_checkpoint: Union[str, Path] = ""     # 微调或预训练权重路径
+    load_in_8bit: bool = False                       # 是否以 8bit 量化载入（仅 openvla 支持）
+    load_in_4bit: bool = False                       # 是否以 4bit 量化载入（仅 openvla 支持）
 
-    center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
+    center_crop: bool = True                         # 是否对输入图像做中心裁剪（若训练时用了随机裁剪，这里要 True）
 
     #################################################################################################################
     # LIBERO environment-specific parameters
     #################################################################################################################
-    task_suite_name: str = "libero_spatial"          # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
-    num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
-    num_trials_per_task: int = 50                    # Number of rollouts per task
+    task_suite_name: str = "libero_spatial"          # 评估的 LIBERO 任务集
+    num_steps_wait: int = 10                         # 刚开始等待的空步骤数（让物体稳定）
+    num_trials_per_task: int = 50                    # 每个任务重复多少次实验
 
     #################################################################################################################
     # Utils
     #################################################################################################################
-    run_id_note: Optional[str] = None                # Extra note to add in run ID for logging
-    local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
+    run_id_note: Optional[str] = None                # 运行 ID 追加说明，便于区分日志
+    local_log_dir: str = "./experiments/logs"        # 本地日志输出目录
 
-    use_wandb: bool = False                          # Whether to also log results in Weights & Biases
-    wandb_project: str = "YOUR_WANDB_PROJECT"        # Name of W&B project to log to (use default!)
-    wandb_entity: str = "YOUR_WANDB_ENTITY"          # Name of entity to log under
+    use_wandb: bool = False                          # 是否启用 W&B 记录
+    wandb_project: str = "YOUR_WANDB_PROJECT"        # W&B 项目名
+    wandb_entity: str = "YOUR_WANDB_ENTITY"          # W&B 工作区
 
-    seed: int = 7                                    # Random Seed (for reproducibility)
+    seed: int = 7                                    # 随机种子，保证可复现
 
     # fmt: on
 
 
 @draccus.wrap()
 def eval_libero(cfg: GenerateConfig) -> None:
-    assert cfg.pretrained_checkpoint is not None, "cfg.pretrained_checkpoint must not be None!"
+    """执行 LIBERO 评估流程，根据配置加载模型、环境并循环任务/episode"""
+    assert cfg.pretrained_checkpoint is not None, "cfg.pretrained_checkpoint must not be None!"  # 必须提供模型权重
     if "image_aug" in cfg.pretrained_checkpoint:
-        assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
-    assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
+        assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"  # 若训练用了增强，评估要对齐裁剪策略
+    assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"  # 不允许同时指定 8/4bit
 
-    # Set random seed
-    set_seed_everywhere(cfg.seed)
+    set_seed_everywhere(cfg.seed)  # 设置随机种子
 
-    # [OpenVLA] Set action un-normalization key
-    cfg.unnorm_key = cfg.task_suite_name
-    # 根据任务套件名称选择动作反归一化参数，确保尺度匹配
+    cfg.unnorm_key = cfg.task_suite_name  # 动作反归一化键默认为任务集名称
+    model = get_model(cfg)  # 加载策略模型（openvla 或其他家族）
 
-    # Load model
-    model = get_model(cfg)
-    # 载入策略模型，可兼容 OpenVLA 或其它模型族
-
-    # [OpenVLA] Check that the model contains the action un-normalization key
-    if cfg.model_family == "openvla":
-        # In some cases, the key must be manually modified (e.g. after training on a modified version of the dataset
-        # with the suffix "_no_noops" in the dataset name)
+    if cfg.model_family == "openvla":  # 仅对 openvla 校验反归一化统计是否存在
         if cfg.unnorm_key not in model.norm_stats and f"{cfg.unnorm_key}_no_noops" in model.norm_stats:
-            cfg.unnorm_key = f"{cfg.unnorm_key}_no_noops"
+            cfg.unnorm_key = f"{cfg.unnorm_key}_no_noops"  # 某些数据集后缀有 _no_noops
         assert cfg.unnorm_key in model.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
 
-    # [OpenVLA] Get Hugging Face processor
-    processor = None
+    processor = None  # Processor 包含图像处理 + tokenizer
     if cfg.model_family == "openvla":
-        processor = get_processor(cfg)
-        # OpenVLA 通过 Processor 完成图像/文本编码，与训练流程保持一致
+        processor = get_processor(cfg)  # 与训练保持一致的 Processor（决定图像变换与 prompt 构造）
 
-    # Initialize local logging
-    run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"
+    run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"  # 生成日志 ID
     if cfg.run_id_note is not None:
-        run_id += f"--{cfg.run_id_note}"
+        run_id += f"--{cfg.run_id_note}"  # 附加备注
     os.makedirs(cfg.local_log_dir, exist_ok=True)
     local_log_filepath = os.path.join(cfg.local_log_dir, run_id + ".txt")
-    log_file = open(local_log_filepath, "w")
+    log_file = open(local_log_filepath, "w")  # 打开本地日志文件
     print(f"Logging to local log file: {local_log_filepath}")
-    # 将评估过程中关键指标写入本地日志文件，便于离线追踪
 
-    # Initialize Weights & Biases logging as well
-    if cfg.use_wandb:
-        wandb.init(
-            entity=cfg.wandb_entity,
-            project=cfg.wandb_project,
-            name=run_id,
-        )
+    if cfg.use_wandb:  # 初始化 W&B
+        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=run_id)
 
-    # Initialize LIBERO task suite
-    benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite = benchmark_dict[cfg.task_suite_name]()
-    num_tasks_in_suite = task_suite.n_tasks
+    benchmark_dict = benchmark.get_benchmark_dict()  # 获取全部任务集
+    task_suite = benchmark_dict[cfg.task_suite_name]()  # 实例化选定任务集
+    num_tasks_in_suite = task_suite.n_tasks  # 任务数量
     print(f"Task suite: {cfg.task_suite_name}")
     log_file.write(f"Task suite: {cfg.task_suite_name}\n")
 
-    # Get expected image dimensions
-    resize_size = get_image_resize_size(cfg)
-    # 统一计算观测图像的缩放尺寸，以匹配模型输入要求
+    resize_size = get_image_resize_size(cfg)  # 根据模型要求计算输入图像尺寸
 
-    # Start evaluation
-    total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
-        # Get task
-        task = task_suite.get_task(task_id)
+    total_episodes, total_successes = 0, 0  # 累计 episode 与成功次数
+    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):  # 逐任务评估
+        task = task_suite.get_task(task_id)  # 取任务描述
+        initial_states = task_suite.get_task_init_states(task_id)  # 官方预设初始状态
+        env, task_description = get_libero_env(task, cfg.model_family, resolution=256)  # 构建环境与文本描述
 
-        # Get default LIBERO initial states
-        initial_states = task_suite.get_task_init_states(task_id)
-        # 每个任务预设若干初始状态，模拟不同场景起点
-
-        # Initialize LIBERO environment and task description
-        env, task_description = get_libero_env(task, cfg.model_family, resolution=256)
-        # 创建具体的 LIBERO 任务环境，返回文字描述供策略生成提示
-
-        # Start episodes
-        task_episodes, task_successes = 0, 0
-        for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
+        task_episodes, task_successes = 0, 0  # 该任务内的统计
+        for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):  # 重复多个 episode
             print(f"\nTask: {task_description}")
             log_file.write(f"\nTask: {task_description}\n")
 
-            # Reset environment
-            env.reset()
-            # 重置环境，保证从同一起点开始评估
+            env.reset()  # 环境复位（机械臂回初始状态）
+            obs = env.set_init_state(initial_states[episode_idx])  # 设置特定初始场景
 
-            # Set initial states
-            obs = env.set_init_state(initial_states[episode_idx])
-            # 应用本轮的初始状态，重现官方评测流程
-
-            # Setup
-            t = 0
-            replay_images = []
+            t = 0  # 时间步计数
+            replay_images = []  # 记录帧，用于生成回放视频
             if cfg.task_suite_name == "libero_spatial":
-                max_steps = 220  # longest training demo has 193 steps
+                max_steps = 220
             elif cfg.task_suite_name == "libero_object":
-                max_steps = 280  # longest training demo has 254 steps
+                max_steps = 280
             elif cfg.task_suite_name == "libero_goal":
-                max_steps = 300  # longest training demo has 270 steps
+                max_steps = 300
             elif cfg.task_suite_name == "libero_10":
-                max_steps = 520  # longest training demo has 505 steps
+                max_steps = 520
             elif cfg.task_suite_name == "libero_90":
-                max_steps = 400  # longest training demo has 373 steps
+                max_steps = 400
 
             print(f"Starting episode {task_episodes+1}...")
             log_file.write(f"Starting episode {task_episodes+1}...\n")
-            while t < max_steps + cfg.num_steps_wait:
+            while t < max_steps + cfg.num_steps_wait:  # 继续循环直到达到最大步数+等待步
                 try:
-                    # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
-                    # and we need to wait for them to fall
-                    if t < cfg.num_steps_wait:
+                    if t < cfg.num_steps_wait:  # 前若干步执行“空动作”，等待物体稳定
                         obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
                         t += 1
                         continue
 
-                    # Get preprocessed image
-                    img = get_libero_image(obs, resize_size)
-                    # 提取和预处理摄像头画面，包含裁剪、缩放和归一化
+                    img = get_libero_image(obs, resize_size)  # 图像预处理（裁剪、缩放、归一化）
+                    replay_images.append(img)  # 保存帧供回放视频使用
 
-                    # Save preprocessed image for replay video
-                    replay_images.append(img)
-                    # 记录图像帧用于生成回放视频
-
-                    # Prepare observations dict
-                    # Note: OpenVLA does not take proprio state as input
-                    observation = {
+                    observation = {  # 构造模型输入（图像 + 状态）
                         "full_image": img,
                         "state": np.concatenate(
-                            (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
+                            (
+                                obs["robot0_eef_pos"],  # 末端位置
+                                quat2axisangle(obs["robot0_eef_quat"]),  # 姿态 (四元数→轴角)
+                                obs["robot0_gripper_qpos"],  # 夹爪开合
+                            )
                         ),
                     }
-                    # 构造策略输入字典，包含视觉图像和关节状态
 
-                    # Query model to get action
-                    action = get_action(
+                    action = get_action(  # 让策略模型输出动作
                         cfg,
                         model,
                         observation,
                         task_description,
                         processor=processor,
                     )
-                    # 调用统一的推理接口，结合文本任务描述生成下一步动作
 
-                    # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
-                    action = normalize_gripper_action(action, binarize=True)
-                    # 将抓手开合量转换到环境期望的 [-1, 1] 范围
-
-                    # [OpenVLA] The dataloader flips the sign of the gripper action to align with other datasets
-                    # (0 = close, 1 = open), so flip it back (-1 = open, +1 = close) before executing the action
+                    action = normalize_gripper_action(action, binarize=True)  # 夹爪控制映射到 [-1,1]
                     if cfg.model_family == "openvla":
-                        action = invert_gripper_action(action)
-                        # OpenVLA 训练时约定与环境相反的符号，这里翻转回去
+                        action = invert_gripper_action(action)  # OpenVLA 训练约定下夹爪符号需翻转
 
-                    # Execute action in environment
-                    obs, reward, done, info = env.step(action.tolist())
+                    obs, reward, done, info = env.step(action.tolist())  # 执行动作
                     if done:
                         task_successes += 1
                         total_successes += 1
                         break
                     t += 1
 
-                except Exception as e:
+                except Exception as e:  # 捕获仿真异常，写日志并终止当前 episode
                     print(f"Caught exception: {e}")
                     log_file.write(f"Caught exception: {e}\n")
                     break
@@ -256,13 +205,14 @@ def eval_libero(cfg: GenerateConfig) -> None:
             task_episodes += 1
             total_episodes += 1
 
-            # Save a replay video of the episode
-            save_rollout_video(
-                replay_images, total_episodes, success=done, task_description=task_description, log_file=log_file
+            save_rollout_video(  # 保存回放视频（供人工回顾）
+                replay_images,
+                total_episodes,
+                success=done,
+                task_description=task_description,
+                log_file=log_file,
             )
-            # 输出视频与日志，记录是否成功完成任务
 
-            # Log current results
             print(f"Success: {done}")
             print(f"# episodes completed so far: {total_episodes}")
             print(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
@@ -271,7 +221,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
             log_file.write(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)\n")
             log_file.flush()
 
-        # Log final results
         print(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         print(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
         log_file.write(f"Current task success rate: {float(task_successes) / float(task_episodes)}\n")
@@ -285,11 +234,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 }
             )
 
-    # Save local log file
-    log_file.close()
+    log_file.close()  # 关闭本地日志文件
 
-    # Push total metrics and local log file to wandb
-    if cfg.use_wandb:
+    if cfg.use_wandb:  # 记录总成功率并上传日志文件到 W&B
         wandb.log(
             {
                 "success_rate/total": float(total_successes) / float(total_episodes),
